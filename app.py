@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -10,7 +11,8 @@ from typing import List, Optional, Tuple
 import requests
 from spellchecker import SpellChecker
 
-GROQ_API_URL ="https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_URL =  "https://api.groq.com/openai/v1/chat/completions"
+MAX_AI_SUGGESTIONS = 8
 
 
 @dataclass
@@ -143,7 +145,7 @@ class FastNLPChecker:
         return issues
 
 
-def extract_json_block(raw: str) -> Optional[dict]:
+def extract_json_block(raw: str) -> Optional[object]:
     raw = raw.strip()
     if not raw:
         return None
@@ -151,14 +153,20 @@ def extract_json_block(raw: str) -> Optional[dict]:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        pass
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            pass
 
     if "```" in raw:
-        raw = raw.replace("```json", "").replace("```", "").strip()
+        raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            pass
+            try:
+                return ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                pass
 
     start = raw.find("{")
     end = raw.rfind("}")
@@ -167,8 +175,83 @@ def extract_json_block(raw: str) -> Optional[dict]:
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            return None
+            try:
+                return ast.literal_eval(candidate)
+            except (ValueError, SyntaxError):
+                pass
+
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            try:
+                return ast.literal_eval(candidate)
+            except (ValueError, SyntaxError):
+                pass
+
     return None
+
+
+def normalize_suggestions(parsed: object) -> List[dict]:
+    if isinstance(parsed, dict):
+        items = parsed.get("suggestions", [])
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        items = []
+
+    cleaned: List[dict] = []
+    for item in items[:MAX_AI_SUGGESTIONS]:
+        if not isinstance(item, dict):
+            continue
+        original = str(item.get("original", "")).strip()
+        replacement = str(item.get("replacement", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if original and replacement:
+            cleaned.append(
+                {
+                    "original": original,
+                    "replacement": replacement,
+                    "reason": reason or "Improves clarity.",
+                }
+            )
+    return cleaned
+
+
+def extract_text_suggestions(raw: str) -> List[dict]:
+    suggestions: List[dict] = []
+    for line in raw.splitlines():
+        line = line.strip(" -\t")
+        line = re.sub(r"^\d+[.)]\s*", "", line)
+        original = ""
+        replacement = ""
+
+        arrow_match = re.search(r"(.+?)\s*(?:->|=>|→)\s*(.+)", line)
+        replace_match = re.search(
+            r"replace\s+[\"']?(.+?)[\"']?\s+with\s+[\"']?(.+?)[\"']?$",
+            line,
+            re.IGNORECASE,
+        )
+
+        if arrow_match:
+            original = arrow_match.group(1).strip(" ' \t:0123456789.")
+            replacement = arrow_match.group(2).strip(" ' \t")
+        elif replace_match:
+            original = replace_match.group(1).strip()
+            replacement = replace_match.group(2).strip()
+
+        if original and replacement:
+            suggestions.append(
+                {
+                    "original": original,
+                    "replacement": replacement,
+                    "reason": "Improves clarity.",
+                }
+            )
+    return suggestions[:MAX_AI_SUGGESTIONS]
 
 
 def get_groq_suggestions(text: str, style: str = "natural") -> Tuple[List[dict], Optional[str]]:
@@ -215,78 +298,172 @@ def get_groq_suggestions(text: str, style: str = "natural") -> Tuple[List[dict],
         return [], "Unexpected Groq response format."
 
     parsed = extract_json_block(content)
-    if not parsed or "suggestions" not in parsed or not isinstance(parsed["suggestions"], list):
+    normalized = normalize_suggestions(parsed)
+    if not normalized:
+        fallback = extract_text_suggestions(content)
+        if fallback:
+            return fallback, None
         return [], "Could not parse AI suggestions as JSON."
 
-    cleaned: List[dict] = []
-    for item in parsed["suggestions"][:MAX_AI_SUGGESTIONS]:
-        if not isinstance(item, dict):
-            continue
-        original = str(item.get("original", "")).strip()
-        replacement = str(item.get("replacement", "")).strip()
-        reason = str(item.get("reason", "")).strip()
-        if original and replacement:
-            cleaned.append(
-                {
-                    "original": original,
-                    "replacement": replacement,
-                    "reason": reason or "Improves clarity.",
-                }
-            )
-
-    return cleaned, None
+    return normalized, None
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Single-File NLP + Groq Writing Assistant")
-        self.root.geometry("920x660")
+        self.root.geometry("980x700")
         self.root.minsize(800, 560)
 
         self.checker = FastNLPChecker()
         self.analyzing = False
+        self.char_count_var = tk.StringVar(value="0 chars | 0 words")
+        self.tone_options = {
+            "Natural (balanced)": "natural",
+            "Concise (short + clear)": "concise",
+            "Formal (professional)": "formal",
+        }
+        self.tone_hint_map = {
+            "natural": "Balanced tone for everyday writing.",
+            "concise": "Shorter phrasing with less fluff.",
+            "formal": "Professional and polished wording.",
+        }
+
+        self._configure_theme()
+        self.root.bind("<Control-Return>", self._trigger_analyze)
+        self.root.bind("<Control-l>", self._trigger_clear)
 
         self._build_ui()
 
+    def _configure_theme(self) -> None:
+        self.root.configure(bg="#10131a")
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+
+        style.configure(".", background="#10131a", foreground="#e5e7eb")
+        style.configure("TFrame", background="#10131a")
+        style.configure("TLabelframe", background="#10131a", bordercolor="#2a3341")
+        style.configure("TLabelframe.Label", background="#10131a", foreground="#e5e7eb")
+        style.configure("TLabel", background="#10131a", foreground="#cbd5e1")
+        style.configure(
+            "Title.TLabel",
+            background="#10131a",
+            foreground="#f8fafc",
+            font=("Segoe UI Semibold", 14),
+        )
+        style.configure(
+            "Subtle.TLabel",
+            background="#10131a",
+            foreground="#94a3b8",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Tone.TLabel",
+            background="#10131a",
+            foreground="#ff9f1c",
+            font=("Segoe UI Semibold", 10),
+        )
+        style.configure(
+            "ToneHint.TLabel",
+            background="#10131a",
+            foreground="#ffbf69",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "TButton",
+            background="#1f2937",
+            foreground="#f8fafc",
+            borderwidth=0,
+            focusthickness=3,
+            focuscolor="#334155",
+            padding=(12, 7),
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#334155"), ("disabled", "#1f2937")],
+            foreground=[("disabled", "#64748b")],
+        )
+        style.configure("Accent.TButton", background="#0ea5e9", foreground="#0f172a")
+        style.map("Accent.TButton", background=[("active", "#38bdf8")])
+        style.configure("TCheckbutton", background="#10131a", foreground="#cbd5e1")
+        style.map("TCheckbutton", background=[("active", "#10131a")])
+        style.configure(
+            "TCombobox",
+            fieldbackground="#0f172a",
+            background="#1f2937",
+            foreground="#e5e7eb",
+            arrowcolor="#cbd5e1",
+        )
+        style.configure(
+            "Tone.TCombobox",
+            fieldbackground="#261708",
+            background="#2f1c09",
+            foreground="#ffd9a6",
+            arrowcolor="#ff9f1c",
+        )
+
     def _build_ui(self) -> None:
+        header = ttk.Frame(self.root)
+        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        ttk.Label(header, text="BE_CORRECT", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Fast local checks + optional Groq AI suggestions",
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=3)
-        self.root.rowconfigure(1, weight=2)
+        self.root.rowconfigure(1, weight=3)
+        self.root.rowconfigure(2, weight=2)
 
         input_frame = ttk.LabelFrame(self.root, text="Input Text")
-        input_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 6))
+        input_frame.grid(row=1, column=0, sticky="nsew", padx=14, pady=(2, 8))
         input_frame.columnconfigure(0, weight=1)
         input_frame.rowconfigure(0, weight=1)
 
-        self.input_text = tk.Text(input_frame, wrap="word", font=("Segoe UI", 11))
-        self.input_text.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        self.input_text = tk.Text(
+            input_frame,
+            wrap="word",
+            font=("Segoe UI", 11),
+            bg="#0b1220",
+            fg="#e2e8f0",
+            insertbackground="#f8fafc",
+            selectbackground="#1d4ed8",
+            relief="flat",
+            padx=12,
+            pady=10,
+        )
+        self.input_text.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
 
         input_scroll = ttk.Scrollbar(input_frame, command=self.input_text.yview)
-        input_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+        input_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
         self.input_text.configure(yscrollcommand=input_scroll.set)
+        self.input_text.bind("<KeyRelease>", self._update_text_metrics)
 
         controls = ttk.Frame(self.root)
-        controls.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        controls.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 12))
         controls.columnconfigure(0, weight=1)
         controls.rowconfigure(1, weight=1)
 
         top_controls = ttk.Frame(controls)
         top_controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        top_controls.columnconfigure(5, weight=1)
+        top_controls.columnconfigure(6, weight=1)
 
-        self.style_var = tk.StringVar(value="natural")
+        self.style_var = tk.StringVar(value="Natural (balanced)")
+        self.tone_hint_var = tk.StringVar(value=self.tone_hint_map["natural"])
         self.ai_enabled_var = tk.BooleanVar(value=True)
 
-        ttk.Label(top_controls, text="AI Style:").grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(top_controls, text="Tone:", style="Tone.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.style_box = ttk.Combobox(
             top_controls,
             state="readonly",
             textvariable=self.style_var,
-            values=["natural", "concise", "formal"],
-            width=12,
+            values=list(self.tone_options.keys()),
+            width=22,
+            style="Tone.TCombobox",
         )
         self.style_box.grid(row=0, column=1, padx=(0, 12))
+        self.style_box.bind("<<ComboboxSelected>>", self._on_tone_change)
 
         self.ai_check = ttk.Checkbutton(
             top_controls,
@@ -295,15 +472,25 @@ class App:
         )
         self.ai_check.grid(row=0, column=2, padx=(0, 12))
 
-        self.analyze_button = ttk.Button(top_controls, text="Analyze", command=self.start_analysis)
+        self.analyze_button = ttk.Button(
+            top_controls, text="Analyze", command=self.start_analysis, style="Accent.TButton"
+        )
         self.analyze_button.grid(row=0, column=3, padx=(0, 8))
 
         self.clear_button = ttk.Button(top_controls, text="Clear", command=self.clear_all)
         self.clear_button.grid(row=0, column=4, padx=(0, 8))
 
+        ttk.Label(top_controls, textvariable=self.char_count_var, style="Subtle.TLabel").grid(
+            row=0, column=5, sticky="w", padx=(2, 10)
+        )
+
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(top_controls, textvariable=self.status_var, foreground="#2f5d8a").grid(
-            row=0, column=5, sticky="e"
+        ttk.Label(top_controls, textvariable=self.status_var, style="Subtle.TLabel").grid(row=0, column=6, sticky="e")
+        ttk.Label(top_controls, textvariable=self.tone_hint_var, style="ToneHint.TLabel").grid(
+            row=1, column=0, columnspan=7, sticky="w", pady=(6, 0)
+        )
+        tk.Frame(top_controls, bg="#ff8a00", height=2).grid(
+            row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0)
         )
 
         result_frame = ttk.LabelFrame(controls, text="Results")
@@ -316,18 +503,45 @@ class App:
             wrap="word",
             state="disabled",
             font=("Consolas", 10),
-            foreground="#222222",
+            bg="#0b1220",
+            fg="#e2e8f0",
+            insertbackground="#f8fafc",
+            selectbackground="#1d4ed8",
+            relief="flat",
+            padx=12,
+            pady=10,
         )
-        self.result_text.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
+        self.result_text.grid(row=0, column=0, sticky="nsew", padx=(10, 0), pady=10)
 
         result_scroll = ttk.Scrollbar(result_frame, command=self.result_text.yview)
-        result_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+        result_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=10)
         self.result_text.configure(yscrollcommand=result_scroll.set)
 
         self.input_text.insert(
             "1.0",
             "this is teh sample text It has some issues , and maybe repeated repeated words",
         )
+        self._update_text_metrics()
+
+    def _trigger_analyze(self, _event: object = None) -> str:
+        self.start_analysis()
+        return "break"
+
+    def _trigger_clear(self, _event: object = None) -> str:
+        self.clear_all()
+        return "break"
+
+    def _update_text_metrics(self, _event: object = None) -> None:
+        text = self.input_text.get("1.0", "end-1c")
+        chars = len(text)
+        words = len([w for w in text.split() if w.strip()])
+        self.char_count_var.set(f"{chars} chars | {words} words")
+
+    def _on_tone_change(self, _event: object = None) -> None:
+        self.tone_hint_var.set(self.tone_hint_map.get(self._selected_style_key(), ""))
+
+    def _selected_style_key(self) -> str:
+        return self.tone_options.get(self.style_var.get(), "natural")
 
     def clear_all(self) -> None:
         if self.analyzing:
@@ -335,6 +549,7 @@ class App:
         self.input_text.delete("1.0", "end")
         self._set_results("")
         self.status_var.set("Ready")
+        self._update_text_metrics()
 
     def start_analysis(self) -> None:
         if self.analyzing:
@@ -359,9 +574,9 @@ class App:
         ai_error: Optional[str] = None
 
         if self.ai_enabled_var.get():
-            ai_suggestions, ai_error = get_groq_suggestions(text, self.style_var.get())
+            ai_suggestions, ai_error = get_groq_suggestions(text, self._selected_style_key())
 
-        output = self._format_output(local_issues, ai_suggestions, ai_error)
+        output = self._format_output(text, local_issues, ai_suggestions, ai_error)
         self.root.after(0, lambda: self._finish_analysis(output, ai_error))
 
     def _finish_analysis(self, output: str, ai_error: Optional[str]) -> None:
@@ -381,6 +596,7 @@ class App:
 
     def _format_output(
         self,
+        source_text: str,
         local_issues: List[Issue],
         ai_suggestions: List[dict],
         ai_error: Optional[str],
@@ -408,7 +624,23 @@ class App:
                     f"{idx}. Replace '{item['original']}' -> '{item['replacement']}' | Why: {item['reason']}"
                 )
 
+        lines.append("")
+        lines.append("=== Final Corrected Text (Block 4) ===")
+        corrected = self._build_corrected_text(source_text, ai_suggestions)
+        lines.append(corrected)
+
         return "\n".join(lines)
+
+    def _build_corrected_text(self, text: str, ai_suggestions: List[dict]) -> str:
+        corrected = text
+        for item in ai_suggestions:
+            original = str(item.get("original", "")).strip()
+            replacement = str(item.get("replacement", "")).strip()
+            if not original or not replacement:
+                continue
+            if original in corrected:
+                corrected = corrected.replace(original, replacement, 1)
+        return corrected
 
 
 def main() -> None:
